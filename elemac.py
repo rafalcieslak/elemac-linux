@@ -3,9 +3,17 @@
 # Unfortunately, this file has to target python3.4 (no never version is
 # available for Debian 8), and thus type annotations are incomplete.
 
+import os
 import sys
+import yaml
+import smtplib
+import argparse
 import usb.core
 import usb.util
+import datetime
+import traceback
+
+LAST_ALERT_TIMESTAMP_FILE = '/tmp/elemac-fishtank-last-alert-'
 
 
 # At the moment, only USB connection is supported.
@@ -27,12 +35,6 @@ class ElemacDevice:
         'day_low': (13, 2, True, "Day Low"),
         'alarm_low': (15, 2, True, "Alarm Low"),
     }
-    MEAS_PRINTABLE_FIELDS = [
-        'measured', 'hysteresis',
-        'day_high', 'day_low',
-        'night_high', 'night_low',
-        'alarm_high', 'alarm_low'
-    ]
 
     # Values follow format: (bank_no, name, unit, value_divisor)
     MEAS_BANKS_DATA = {
@@ -129,39 +131,229 @@ class ElemacDevice:
         return meas
 
     def update_all_measurements(self) -> None:
-        self.meas_values = {}  # type: ignore
+        self.measurements = {}  # type: ignore
+        self.available_measurements = {}  # type: ignore
         for code, data in self.MEAS_BANKS_DATA.items():
             bank, name, unit, divisor = data
             meas = self.read_meas(bank, divisor)
-            self.meas_values[code] = meas
+            self.measurements[code] = meas
+            self.measurements[code]['bank'] = bank
+            self.measurements[code]['name'] = name
+            self.measurements[code]['unit'] = unit
+            self.measurements[code]['divisor'] = divisor
 
-    def print_available_measurements(self):
-        for code, meas in self.meas_values.items():
-            if not meas['available']:
-                continue
-            _, name, unit, _ = self.MEAS_BANKS_DATA[code]
-            print("{}:".format(name))
+            if meas['available']:
+                self.available_measurements[code] = self.measurements[code]
 
-            for field in self.MEAS_PRINTABLE_FIELDS:
-                _, _, _, field_name = self.MEAS_FIELD_DATA[field]
+        self.available_measurements = sorted(
+            self.available_measurements.items(), key=lambda x: x[0])
+
+
+class ElemacController:
+    def __init__(self):
+        try:
+            with open('/etc/elemac', 'r') as file:
+                self.config = yaml.load(file)
+        except FileNotFoundError:
+            self.config = {}
+
+        # TODO: At the moment, only single device connection is supported.
+        dev = usb.core.find(idVendor=0x04d8, idProduct=0x003f)
+        if dev is None:
+            sys.exit("No ELEMAC is connected via USB.")
+
+        self.elemac = ElemacDevice(dev)
+
+        if not self.elemac.connect():
+            sys.exit("Failed to connect with ELEMAC.")
+
+    def show_all(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            print("{}:".format(meas['name']))
+
+            for field in ['measured', 'hysteresis',
+                          'day_high', 'day_low',
+                          'night_high', 'night_low',
+                          'alarm_high', 'alarm_low']:
+                field_name = self.elemac.MEAS_FIELD_DATA[field][3]
                 print("    {}: {}{}".format(
-                    field_name, meas[field], unit))
+                    field_name, meas[field], meas['unit']))
+
+    def show_basic(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            print("{}: {}{}".format(
+                meas['name'], meas['measured'], meas['unit']))
+
+    def check_alarms(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            if meas['measured'] > meas['alarm_high']:
+                summary = "ALARM! {} is too high ({})".format(
+                    meas['name'], meas['measured'])
+                details = ("Measured value of {} ({}) is above alarm_high "
+                           "threshold ({}).".format(
+                               meas['name'], meas['measured'],
+                               meas['alarm_high']))
+                print(summary)
+                print(details)
+                self.send_alerts(summary, details, dedup_channel=code)
+
+            if meas['measured'] < meas['alarm_low']:
+                summary = "ALARM! {} is too low ({})".format(
+                    meas['name'], meas['measured'])
+                details = ("Measured value of {} ({}) is below alarm_low "
+                           "threshold ({}).".format(
+                               meas['name'], meas['measured'],
+                               meas['alarm_low']))
+                print(summary)
+                print(details)
+                self.send_alerts(summary, details, dedup_channel=code)
+
+    def test_alerts(self, args):
+        self.send_alerts(
+            "Elemac fishtank test alert",
+            "If you see this message, then alert delivery is working",
+            dedup_channel=None)
+
+    # Returns True if an alert should be suppressed.
+    def check_dedup_suppression(self, dedup_channel) -> bool:
+        if not dedup_channel:
+            return False  # Dedup disabled
+        if 'alert_dedup_suppression_hours' not in self.config:
+            return False
+        hours = self.config['alert_dedup_suppression_hours']
+
+        try:
+            with open(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 'r') as file:
+                str = file.readline()
+            last_alert = datetime.datetime.strptime(
+                str, "%Y-%m-%dT%H:%M:%S.%f")
+            delta = datetime.datetime.now() - last_alert
+            if delta < datetime.timedelta(hours=hours):
+                print("Alert suppressed. Last alert was sent {} ago, "
+                      "which is less than {} hours configured.".format(
+                          delta, hours))
+                return True
+            return False
+        except FileNotFoundError:
+            return False  # No dedup data saved.
+        except ValueError:
+            return False  # Last timestamp saved in a wrong format.
+
+    def save_dedup_suppression_state(self, dedup_channel):
+        if not dedup_channel:
+            return
+        with open(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 'w') as file:
+            file.write(datetime.datetime.now().isoformat())
+        os.chmod(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 0o666)
+
+    def send_alerts(self, summary, details, brief=None,
+                    dedup_channel='other'):
+        if not brief:
+            brief = summary
+
+        if self.check_dedup_suppression(dedup_channel):
+            return
+
+        if dedup_channel and 'alert_dedup_suppression_hours' in self.config:
+            details += ("\nNote that due to alert deduplication subsequent "
+                        "alerts will be suppressed for the next {} hours."
+                        .format(self.config['alert_dedup_suppression_hours']))
+
+        self.send_email_alert(summary, details)
+        self.send_sms_alert(brief)
+
+        self.save_dedup_suppression_state(dedup_channel)
+
+    def send_email_alert(self, summary, details):
+        email_host = self.config.get('email_host', None)
+        if not email_host:
+            print("Not sending email, email_host is not configured")
+            return
+        email_port = self.config.get('email_port', 465)
+        email_user = self.config.get('email_user', None)
+        if not email_user:
+            print("Not sending email, email_user is not configured")
+            return
+        email_password = self.config.get('email_password', None)
+        if not email_password:
+            print("Not sending email, email_password is not configured")
+            return
+        email_from = self.config.get('email_from', email_user)
+        email_to = self.config.get('email_to')
+        if not email_to:
+            print("Not sending email, email_to is not configured")
+            return
+        email_to_list = [e.strip() for e in email_to.split(',')]
+
+        email_message = "From: {}\nTo: {}\nSubject: {}\n\n{}".format(
+            email_from, email_to, summary, details)
+
+        try:
+            # Non-SSL connections are not supported.
+            server_ssl = smtplib.SMTP_SSL(email_host, email_port)
+            server_ssl.login(email_user, email_password)
+            server_ssl.sendmail(email_from, email_to_list, email_message)
+            server_ssl.close()
+            print("Email alert sent.")
+        except Exception as e:
+            traceback.print_exception(*sys.exc_info())
+
+    def send_sms_alert(self, message):
+        # Not implemented yet.
+        pass
 
 
 def main() -> None:
-    # TODO: At the moment, only single device connection is supported.
-    dev = usb.core.find(idVendor=0x04d8, idProduct=0x003f)
-    if dev is None:
-        sys.exit("No ELEMAC is connected via USB.")
+    parser = argparse.ArgumentParser(prog='elemac')
+    subparsers = parser.add_subparsers(dest='command')
 
-    elemac = ElemacDevice(dev)
+    parser_show = subparsers.add_parser(
+        'show', help='Print out measurements and configuration.')
 
-    connected = elemac.connect()
-    if not connected:
-        sys.exit("Failed to connect with ELEMAC.")
+    subparsers_show = parser_show.add_subparsers(dest='show_command')
 
-    elemac.update_all_measurements()
-    elemac.print_available_measurements()
+    subparsers_show.add_parser(
+        'basic', help='Print out just measured values.')
+    subparsers_show.add_parser(
+        'all', help='Print out all measurements and configuration values.')
+
+    subparsers.add_parser(
+        'check_alarms', help='Check all measurements for alarm state and '
+        'send notifications, if configured.')
+    subparsers.add_parser(
+        'test_alerts', help='Sends a dummy alert to test delivery.')
+
+    args = parser.parse_args()
+
+    controller = ElemacController()
+
+    # EC = ElemacController
+    # func = {
+    #     None: EC.show_basic,
+    #     'show': {
+    #         None: EC.show_basic,
+    #         'basic': EC.show_basic,
+    #         'all': EC.show_all
+    #     }
+    # }
+
+    if not args.command:
+        controller.show_basic(args)
+    elif args.command == 'show':
+        if args.show_command == 'basic':
+            controller.show_basic(args)
+        elif args.show_command == 'all':
+            controller.show_all(args)
+    elif args.command == 'check_alarms':
+        controller.check_alarms(args)
+    elif args.command == 'test_alerts':
+        controller.test_alerts(args)
 
 
 if __name__ == "__main__":
