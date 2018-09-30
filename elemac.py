@@ -3,8 +3,10 @@
 # Unfortunately, this file has to target python3.4 (no never version is
 # available for Debian 8), and thus type annotations are incomplete.
 
+import io
 import os
 import sys
+import csv
 import yaml
 import json
 import smtplib
@@ -13,6 +15,8 @@ import usb.core
 import usb.util
 import datetime
 import traceback
+import email.mime.multipart
+import email.mime.text
 
 DATA_DIR = '/var/elemac'
 LAST_ALERT_TIMESTAMP_FILE = '/var/elemac/last-alert-'
@@ -186,7 +190,7 @@ class ElemacController:
                 str = file.readline()
             last_alert = datetime.datetime.strptime(
                 str, "%Y-%m-%dT%H:%M:%S.%f")
-            delta = datetime.datetime.now() - last_alert
+            delta = datetime.datetime.utcnow() - last_alert
             if delta < datetime.timedelta(hours=hours):
                 print("Alert suppressed. Last alert was sent {} ago, "
                       "which is less than {} hours configured.".format(
@@ -202,7 +206,7 @@ class ElemacController:
         if not dedup_channel:
             return
         with open(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 'w') as file:
-            file.write(datetime.datetime.now().isoformat())
+            file.write(datetime.datetime.utcnow().isoformat())
         os.chmod(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 0o666)
 
     def send_alerts(self, summary, details, brief=None,
@@ -218,12 +222,13 @@ class ElemacController:
                         "alerts will be suppressed for the next {} hours."
                         .format(self.config['alert_dedup_suppression_hours']))
 
-        self.send_email_alert(summary, details)
-        self.send_sms_alert(brief)
+        self.send_email(summary, details)
+        self.send_sms(brief)
+        print("Alerts sent.")
 
         self.save_dedup_suppression_state(dedup_channel)
 
-    def send_email_alert(self, summary, details):
+    def send_email(self, subject, message, attachments=[]):
         email_host = self.config.get('email_host', None)
         if not email_host:
             print("Not sending email, email_host is not configured")
@@ -244,20 +249,25 @@ class ElemacController:
             return
         email_to_list = [e.strip() for e in email_to.split(',')]
 
-        email_message = "From: {}\nTo: {}\nSubject: {}\n\n{}".format(
-            email_from, email_to, summary, details)
+        msg = email.mime.multipart.MIMEMultipart()
+        msg["From"] = email_from
+        msg["To"] = email_to
+        msg["Subject"] = subject
+        msg.preamble = subject
+        msg.attach(email.mime.text.MIMEText(message))
+        for attachment in attachments:
+            msg.attach(attachment)
 
         try:
             # Non-SSL connections are not supported.
             server_ssl = smtplib.SMTP_SSL(email_host, email_port)
             server_ssl.login(email_user, email_password)
-            server_ssl.sendmail(email_from, email_to_list, email_message)
+            server_ssl.sendmail(email_from, email_to_list, msg.as_string())
             server_ssl.close()
-            print("Email alert sent.")
         except Exception as e:
             traceback.print_exception(*sys.exc_info())
 
-    def send_sms_alert(self, message):
+    def send_sms(self, message):
         # Not implemented yet.
         pass
 
@@ -320,7 +330,7 @@ class ElemacController:
         self.elemac.update_all_measurements()
 
         data = {
-            'ts': datetime.datetime.now().replace(
+            'ts': datetime.datetime.utcnow().replace(
                 microsecond=0).isoformat(sep=' ')
         }
         for code, meas in self.elemac.available_measurements:
@@ -328,6 +338,53 @@ class ElemacController:
 
         with open(HISTORIC_DATA_FILE, 'a') as file:
             file.write(json.dumps(data, sort_keys=True) + "\n")
+        os.chmod(HISTORIC_DATA_FILE, 0o666)
+
+    def generate_reports(self, args):
+        data = []
+
+        with open(HISTORIC_DATA_FILE, 'r') as file:
+            for line in file:
+                entry = json.loads(line)
+                entry['ts'] = datetime.datetime.strptime(
+                    entry['ts'], "%Y-%m-%d %H:%M:%S")
+                data.append(entry)
+
+        columns = set()
+        for entry in data:
+            columns.update({x for x in entry})
+        columns = sorted(list(columns), key=lambda x: '' if x == 'ts' else x)
+
+        DAY_RANGES = [7, 30]
+
+        attachments = []
+        for r in DAY_RANGES:
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=r)
+            ranged_data = [
+                entry for entry in data
+                if entry['ts'] >= cutoff]
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(ranged_data)
+
+            csv_str = output.getvalue()
+
+            attachment = email.mime.text.MIMEText(csv_str, _subtype='csv')
+            attachment.add_header(
+                "Content-Disposition", "attachment",
+                filename='last_{}_days.csv'.format(r))
+            attachments.append(attachment)
+
+        self.send_email(
+            "Elemac periodic report",
+            "Measurements history is attached as CSV files.",
+            attachments
+        )
+        print("Reports sent.")
+
+        # TODO: Sometimes trim the data file to prevent it from growing too
+        # large.
 
 
 def main() -> None:
@@ -352,6 +409,9 @@ def main() -> None:
     subparsers.add_parser(
         'store_chart_data', help='Call this periodically to gather chart '
         'data into a file.')
+    subparsers.add_parser(
+        'generate_reports', help='Generates chart files and delivers them '
+        'via email.')
 
     args = parser.parse_args()
 
@@ -380,6 +440,8 @@ def main() -> None:
         controller.test_alerts(args)
     elif args.command == 'store_chart_data':
         controller.store_chart_data(args)
+    elif args.command == 'generate_reports':
+        controller.generate_reports(args)
 
 
 if __name__ == "__main__":

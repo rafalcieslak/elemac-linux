@@ -1,2 +1,3 @@
 * * * * * /opt/elemac/elemac check_alarms >> /var/log/elemac_alarms.log
-10 * * * * /opt/elemac/elemac store_chart_data
+*/10 * * * * /opt/elemac/elemac store_chart_data
+0 9 * * SAT /opt/elemac/elemac generate_reports
