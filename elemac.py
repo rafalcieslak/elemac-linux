@@ -6,6 +6,7 @@
 import os
 import sys
 import yaml
+import json
 import smtplib
 import argparse
 import usb.core
@@ -13,7 +14,9 @@ import usb.util
 import datetime
 import traceback
 
-LAST_ALERT_TIMESTAMP_FILE = '/tmp/elemac-fishtank-last-alert-'
+DATA_DIR = '/var/elemac'
+LAST_ALERT_TIMESTAMP_FILE = '/var/elemac/last-alert-'
+HISTORIC_DATA_FILE = '/var/elemac/data.log'
 
 
 # At the moment, only USB connection is supported.
@@ -157,6 +160,9 @@ class ElemacController:
         except FileNotFoundError:
             self.config = {}
 
+        # Ensure the data directory exists.
+        os.makedirs(DATA_DIR, exist_ok=True)
+
         # TODO: At the moment, only single device connection is supported.
         dev = usb.core.find(idVendor=0x04d8, idProduct=0x003f)
         if dev is None:
@@ -166,59 +172,6 @@ class ElemacController:
 
         if not self.elemac.connect():
             sys.exit("Failed to connect with ELEMAC.")
-
-    def show_all(self, args):
-        self.elemac.update_all_measurements()
-
-        for code, meas in self.elemac.available_measurements:
-            print("{}:".format(meas['name']))
-
-            for field in ['measured', 'hysteresis',
-                          'day_high', 'day_low',
-                          'night_high', 'night_low',
-                          'alarm_high', 'alarm_low']:
-                field_name = self.elemac.MEAS_FIELD_DATA[field][3]
-                print("    {}: {}{}".format(
-                    field_name, meas[field], meas['unit']))
-
-    def show_basic(self, args):
-        self.elemac.update_all_measurements()
-
-        for code, meas in self.elemac.available_measurements:
-            print("{}: {}{}".format(
-                meas['name'], meas['measured'], meas['unit']))
-
-    def check_alarms(self, args):
-        self.elemac.update_all_measurements()
-
-        for code, meas in self.elemac.available_measurements:
-            if meas['measured'] > meas['alarm_high']:
-                summary = "ALARM! {} is too high ({})".format(
-                    meas['name'], meas['measured'])
-                details = ("Measured value of {} ({}) is above alarm_high "
-                           "threshold ({}).".format(
-                               meas['name'], meas['measured'],
-                               meas['alarm_high']))
-                print(summary)
-                print(details)
-                self.send_alerts(summary, details, dedup_channel=code)
-
-            if meas['measured'] < meas['alarm_low']:
-                summary = "ALARM! {} is too low ({})".format(
-                    meas['name'], meas['measured'])
-                details = ("Measured value of {} ({}) is below alarm_low "
-                           "threshold ({}).".format(
-                               meas['name'], meas['measured'],
-                               meas['alarm_low']))
-                print(summary)
-                print(details)
-                self.send_alerts(summary, details, dedup_channel=code)
-
-    def test_alerts(self, args):
-        self.send_alerts(
-            "Elemac fishtank test alert",
-            "If you see this message, then alert delivery is working",
-            dedup_channel=None)
 
     # Returns True if an alert should be suppressed.
     def check_dedup_suppression(self, dedup_channel) -> bool:
@@ -308,6 +261,74 @@ class ElemacController:
         # Not implemented yet.
         pass
 
+    # ========= Commands =========
+
+    def show_all(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            print("{}:".format(meas['name']))
+
+            for field in ['measured', 'hysteresis',
+                          'day_high', 'day_low',
+                          'night_high', 'night_low',
+                          'alarm_high', 'alarm_low']:
+                field_name = self.elemac.MEAS_FIELD_DATA[field][3]
+                print("    {}: {}{}".format(
+                    field_name, meas[field], meas['unit']))
+
+    def show_basic(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            print("{}: {}{}".format(
+                meas['name'], meas['measured'], meas['unit']))
+
+    def check_alarms(self, args):
+        self.elemac.update_all_measurements()
+
+        for code, meas in self.elemac.available_measurements:
+            if meas['measured'] > meas['alarm_high']:
+                summary = "ALARM! {} is too high ({})".format(
+                    meas['name'], meas['measured'])
+                details = ("Measured value of {} ({}) is above alarm_high "
+                           "threshold ({}).".format(
+                               meas['name'], meas['measured'],
+                               meas['alarm_high']))
+                print(summary)
+                print(details)
+                self.send_alerts(summary, details, dedup_channel=code)
+
+            if meas['measured'] < meas['alarm_low']:
+                summary = "ALARM! {} is too low ({})".format(
+                    meas['name'], meas['measured'])
+                details = ("Measured value of {} ({}) is below alarm_low "
+                           "threshold ({}).".format(
+                               meas['name'], meas['measured'],
+                               meas['alarm_low']))
+                print(summary)
+                print(details)
+                self.send_alerts(summary, details, dedup_channel=code)
+
+    def test_alerts(self, args):
+        self.send_alerts(
+            "Elemac fishtank test alert",
+            "If you see this message, then alert delivery is working",
+            dedup_channel=None)
+
+    def store_chart_data(self, args):
+        self.elemac.update_all_measurements()
+
+        data = {
+            'timestamp': datetime.datetime.now().replace(
+                microsecond=0).isoformat(sep=' ')
+        }
+        for code, meas in self.elemac.available_measurements:
+            data[code] = meas['measured']
+
+        with open(HISTORIC_DATA_FILE, 'a') as file:
+            file.write(json.dumps(data, sort_keys=True) + "\n")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog='elemac')
@@ -328,6 +349,9 @@ def main() -> None:
         'send notifications, if configured.')
     subparsers.add_parser(
         'test_alerts', help='Sends a dummy alert to test delivery.')
+    subparsers.add_parser(
+        'store_chart_data', help='Call this periodically to gather chart '
+        'data into a file.')
 
     args = parser.parse_args()
 
@@ -354,6 +378,8 @@ def main() -> None:
         controller.check_alarms(args)
     elif args.command == 'test_alerts':
         controller.test_alerts(args)
+    elif args.command == 'store_chart_data':
+        controller.store_chart_data(args)
 
 
 if __name__ == "__main__":
