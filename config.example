@@ -1,0 +1,6 @@
+email_host: smtp.gmail.com
+email_user: some.exaple.email@gmail.com
+email_password: passw0rd
+email_to: receipient1@example.com, recipient2@example.com
+
+alert_dedup_suppression_hours: 4

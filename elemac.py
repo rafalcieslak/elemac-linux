@@ -320,7 +320,7 @@ class ElemacController:
         self.elemac.update_all_measurements()
 
         data = {
-            'timestamp': datetime.datetime.now().replace(
+            'ts': datetime.datetime.now().replace(
                 microsecond=0).isoformat(sep=' ')
         }
         for code, meas in self.elemac.available_measurements:
