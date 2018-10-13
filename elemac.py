@@ -9,6 +9,7 @@ import sys
 import csv
 import yaml
 import json
+import time
 import smtplib
 import argparse
 import usb.core
@@ -61,6 +62,20 @@ class ElemacDevice:
     def __del__(self):
         pass
 
+    # Returns True iff detach was successful
+    def try_detach(self, retries=5):
+        if retries <= 0:
+            print("Retry limit reached, aborting.")
+            return False
+        if self.dev.is_kernel_driver_active(0) is True:
+            try:
+                self.dev.detach_kernel_driver(0)
+                return True
+            except usb.core.USBError as e:
+                print("Unable to detach kernel driver: " + str(e))
+                time.sleep(1)
+                return self.try_detach(retries-1)
+
     # Initializes connection; returns True iff connection was successful.
     def connect(self):
         self.manufacturer = usb.util.get_string(
@@ -83,7 +98,7 @@ class ElemacDevice:
             print("Unable to detach kernel driver: " + str(e))
             return False
 
-        self.dev.reset()
+        # self.dev.reset()
 
         configuration = self.dev[0]
         configuration.set()
@@ -440,6 +455,8 @@ def main() -> None:
             controller.show_basic(args)
         elif args.show_command == 'all':
             controller.show_all(args)
+        else:
+            controller.show_basic(args)
     elif args.command == 'check_alarms':
         controller.check_alarms(args)
     elif args.command == 'test_alerts':
