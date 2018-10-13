@@ -207,7 +207,10 @@ class ElemacController:
             return
         with open(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 'w') as file:
             file.write(datetime.datetime.utcnow().isoformat())
-        os.chmod(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 0o666)
+        try:
+            os.chmod(LAST_ALERT_TIMESTAMP_FILE + dedup_channel, 0o666)
+        except PermissionError:
+            pass
 
     def send_alerts(self, summary, details, brief=None,
                     dedup_channel='other'):
@@ -338,7 +341,10 @@ class ElemacController:
 
         with open(HISTORIC_DATA_FILE, 'a') as file:
             file.write(json.dumps(data, sort_keys=True) + "\n")
-        os.chmod(HISTORIC_DATA_FILE, 0o666)
+        try:
+            os.chmod(HISTORIC_DATA_FILE, 0o666)
+        except PermissionError:
+            pass
 
     def generate_reports(self, args):
         data = []
