@@ -361,6 +361,30 @@ class ElemacController:
         except PermissionError:
             pass
 
+    # Returns a CSV string.
+    def generate_csv_report(self, data, columns) -> str:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(data)
+        return output.getvalue()
+
+    # Returns a BytesIO with png chart
+#    def generate_png_chart(self, data, columns) -> io.BytesIO:
+#        for series in columns:
+#            v = np.empty([0, 2])
+#            print(v)
+#            for row in data:
+#                v = np.append(v, [row['ts'], row[series]])
+#            print(v)
+#
+#        plt.plot(v)
+#
+#        buf = io.BytesIO()
+#        plt.savefig(buf, format='png')
+#        buf.seek(0)
+#        return buf
+
     def generate_reports(self, args):
         data = []
 
@@ -381,21 +405,25 @@ class ElemacController:
         attachments = []
         for r in DAY_RANGES:
             cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=r)
-            ranged_data = [
-                entry for entry in data
-                if entry['ts'] >= cutoff]
-            output = io.StringIO()
-            writer = csv.DictWriter(output, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(ranged_data)
+            ranged_data = [entry for entry in data
+                           if entry['ts'] >= cutoff]
 
-            csv_str = output.getvalue()
+            csv_str = self.generate_csv_report(ranged_data, columns)
+            #png_bytes = self.generate_png_chart(ranged_data, columns)
 
             attachment = email.mime.text.MIMEText(csv_str, _subtype='csv')
             attachment.add_header(
                 "Content-Disposition", "attachment",
                 filename='last_{}_days.csv'.format(r))
             attachments.append(attachment)
+
+            #png_part = email.mime.base.MIMEBase('application', "octet-stream")
+            #png_part.set_payload(png_bytes.read())
+            #email.encoders.encode_base64(png_part)
+            #png_part.add_header(
+            #    "Content-Disposition", "attachment",
+            #    filename='last_{}_days.png'.format(r))
+            #attachments.append(png_part)
 
         self.send_email(
             "Elemac periodic report",
