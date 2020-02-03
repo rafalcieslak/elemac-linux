@@ -390,7 +390,11 @@ class ElemacController:
 
         with open(HISTORIC_DATA_FILE, 'r') as file:
             for line in file:
-                entry = json.loads(line)
+                try:
+                    entry = json.loads(line.strip())
+                except ValueError as e:
+                    print(line.strip())
+                    continue
                 entry['ts'] = datetime.datetime.strptime(
                     entry['ts'], "%Y-%m-%d %H:%M:%S")
                 data.append(entry)
